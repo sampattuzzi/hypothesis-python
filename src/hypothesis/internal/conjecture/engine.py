@@ -28,6 +28,8 @@ from hypothesis.reporting import debug_report
 from hypothesis.internal.compat import EMPTY_BYTES, Counter, hbytes, \
     hrange, text_type, bytes_from_list, to_bytes_sequence, \
     unicode_safe_repr
+from hypothesis.internal.corpus import Corpus
+from hypothesis.internal.prioritymap import PriorityMap
 from hypothesis.internal.conjecture.data import Status, StopTest, \
     ConjectureData
 from hypothesis.internal.conjecture.minimizer import minimize
@@ -63,6 +65,24 @@ class ConjectureRunner(object):
         self.start_time = time.time()
         self.random = random or Random(getrandbits(128))
         self.database_key = database_key
+        self.tag_priorities = PriorityMap()
+        self.fresh_generations = 0
+
+        if (
+            database_key is not None and
+            self.settings.database is not None
+        ):
+            corpus_key = database_key + b'.corpus'
+            self.corpus = Corpus(
+                add_callback=lambda value: self.settings.database.save(
+                    corpus_key, value
+                ),
+                remove_callback=lambda value: self.settings.database.delete(
+                    corpus_key, value
+                ),
+            )
+        else:
+            self.corpus = Corpus()
         self.status_runtimes = {}
         self.events_to_strings = WeakKeyDictionary()
 
@@ -80,6 +100,19 @@ class ConjectureRunner(object):
 
     def __tree_is_exhausted(self):
         return 0 in self.dead
+
+    def select_target(self):
+        if self.__tree_is_exhausted():
+            return
+
+        if len(self.tag_priorities) > 0:
+            tag, (count, tries) = self.tag_priorities.peek()
+            if count < self.fresh_generations:
+                self.tag_priorities[tag] = (count, tries + 1)
+                self.last_data = self.corpus.for_tag(tag)
+                return
+        self.fresh_generations += 1
+        self.new_buffer()
 
     def new_buffer(self):
         assert not self.__tree_is_exhausted()
@@ -110,6 +143,13 @@ class ConjectureRunner(object):
         self.debug_data(data)
         if data.status >= Status.VALID:
             self.valid_examples += 1
+            self.corpus.add(data.buffer, data, data.tags)
+            for t in data.tags:
+                try:
+                    count, tries = self.tag_priorities[t]
+                except KeyError:
+                    count, tries = 1, -1
+                self.tag_priorities[t] = (count + 1, tries)
 
         tree_node = self.tree[0]
         indices = []
@@ -161,14 +201,14 @@ class ConjectureRunner(object):
             return True
         return True
 
-    def save_buffer(self, buffer):
+    def save_buffer(self, buffer, key=None):
         if (
             self.settings.database is not None and
             self.database_key is not None and
             Phase.reuse in self.settings.phases
         ):
             self.settings.database.save(
-                self.database_key, hbytes(buffer)
+                key or self.database_key, hbytes(buffer)
             )
 
     def note_details(self, data):
@@ -413,7 +453,7 @@ class ConjectureRunner(object):
                 self.last_data is None or
                 self.last_data.status < Status.INTERESTING
             ):
-                self.new_buffer()
+                self.select_target()
 
             mutator = self._new_mutator()
             while (
@@ -436,7 +476,7 @@ class ConjectureRunner(object):
                     return
                 if mutations >= self.settings.max_mutations:
                     mutations = 0
-                    self.new_buffer()
+                    self.select_target()
                     mutator = self._new_mutator()
                 else:
                     data = ConjectureData(
